@@ -1,0 +1,21 @@
+# ============================================================
+#  Universal Media Downloader Bot - Requirements
+#  Install: pip install -r requirements.txt
+# ============================================================
+
+# Telegram Bot API wrapper
+pyTelegramBotAPI>=4.22.0
+
+# Video/audio/photo downloading engine
+yt-dlp[default]>=2026.7.4
+
+# PO Token provider - MUST match the git tag used in the Dockerfile.
+# A major-version mismatch makes the provider reject every request,
+# so the bot silently runs without PO tokens and fails on datacenter IPs.
+bgutil-ytdlp-pot-provider==2.0.2
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# SOCKS proxy support (needed for socks5 proxies)
+requests[socks]>=2.31.0

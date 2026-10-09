@@ -1,0 +1,43 @@
+# ============================================================
+#  systemd service for Media Downloader Bot
+#  Place at: /etc/systemd/system/media-downloader-bot.service
+# ============================================================
+#
+#  Setup:
+#    sudo cp media-downloader-bot.service /etc/systemd/system/
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable media-downloader-bot
+#    sudo systemctl start media-downloader-bot
+#
+#  Management:
+#    sudo systemctl status media-downloader-bot
+#    sudo systemctl restart media-downloader-bot
+#    sudo journalctl -u media-downloader-bot -f
+# ============================================================
+
+[Unit]
+Description=Universal Media Downloader Telegram Bot
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=your_user
+WorkingDirectory=/home/your_user/downloader_bot
+Environment=PATH=/home/your_user/downloader_bot/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/your_user/downloader_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/your_user/downloader_bot/downloads
+ReadWritePaths=/home/your_user/downloader_bot/bot.log
+
+[Install]
+WantedBy=multi-user.target
