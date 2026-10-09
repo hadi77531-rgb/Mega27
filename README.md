@@ -259,6 +259,75 @@ Priority at startup: `YOUTUBE_COOKIES_URL` → `YOUTUBE_COOKIES_B64_1..N` →
 `YOUTUBE_COOKIES`. A source that fails is skipped with a warning and the next
 one is tried.
 
+### Keep the container awake (Back4App free plan)
+
+Back4App's free plan sleeps the container after about **5 minutes with no
+inbound traffic**. The bot only makes *outbound* requests while polling, so
+they never count and the app goes quiet. Two independent fixes:
+
+#### 1. Uptime monitor — required, this is what actually keeps it up
+
+Point a free monitor at the app's public URL every **3 to 5 minutes**:
+
+| Service | Free tier | Minimum interval |
+|---|---|---|
+| [UptimeRobot](https://uptimerobot.com/) | 50 monitors | 5 min |
+| [cron-job.org](https://cron-job.org/) | 12 jobs | 1 min |
+
+Both only send `GET`, and every one of these answers `200`:
+
+```
+/          {"status":"ok","yt_dlp":"...","bgutil_plugin":"2.0.2","po_provider":"http", ...}
+/health    same
+/healthz   same
+```
+
+A monitor that also matches a keyword can look for `"status":"ok"`.
+**No code change is needed** — the health server has always been there.
+
+> Polling alone does not keep the container awake. The monitor is the fix.
+
+#### 2. Telegram webhook — optional
+
+Normally the bot *pulls* updates (`getUpdates`). With a webhook, Telegram
+*pushes* them into the same HTTP server, so the first message after idle
+arrives without waiting for a poll.
+
+Set one extra variable in Back4App:
+
+```
+WEBHOOK_URL=https://your-app.b4a.run
+```
+
+What the bot does with it:
+
+1. Registers `<WEBHOOK_URL>/telegram` with Telegram, using a random
+   `secret_token` (`TELEGRAM_SECRET_TOKEN` overrides it if you want a fixed
+   one). Telegram must echo that value in the
+   `X-Telegram-Bot-Api-Secret-Token` header, and the server compares it in
+   constant time — anything else gets `403`.
+2. Serves `POST /telegram` **on the same `$PORT`** as the health endpoint.
+   No Flask, no second server, no extra dependency.
+3. Stops polling (running both at once makes Telegram answer `409`).
+4. If registration fails — bad URL, TLS problem, no listener — it logs the
+   error and **falls back to polling on its own**, so a wrong value cannot
+   brick the bot.
+
+Leaving `WEBHOOK_URL` unset keeps the safe polling default.
+
+> A webhook does **not** replace the uptime monitor. Between messages there
+> is still no inbound traffic, so the container would still sleep.
+
+#### Debugging
+
+| Symptom | Meaning |
+|---|---|
+| `Webhook registered: https://.../telegram` in Running Logs | Registration worked |
+| `set_webhook(...) failed: ...` then `falling back to polling` | URL/TLS problem — fix `WEBHOOK_URL` or delete it |
+| `Webhook payload rejected: ...` | Telegram's body could not be parsed; it is acknowledged, not retried |
+| `403` on `/telegram` | Header secret mismatch (container restarted with a new generated secret — Telegram picks it up on the next start) |
+| `POST /telegram` returns `404` | The health server never bound `$PORT` |
+
 ### ⚠️ Version pinning (this was the main bug)
 
 `requirements.txt` pins `bgutil-ytdlp-pot-provider==2.0.2` and the Dockerfile

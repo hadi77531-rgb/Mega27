@@ -19,6 +19,7 @@ import time
 import gzip
 import base64
 import shutil
+import secrets
 import logging
 import subprocess
 import tempfile
@@ -1914,15 +1915,53 @@ def safe_polling() -> None:
 
 
 # ============================================================
-#  HEALTH ENDPOINT
-#  Railway (and any reverse proxy) can see the process is alive
-#  and read the PO token state without reading logs.
+#  HEALTH ENDPOINT + OPTIONAL TELEGRAM WEBHOOK
+#  An uptime monitor / reverse proxy can see the process is
+#  alive and read the PO token state without reading logs.
+#
+#  Back4App's free plan sleeps the container after ~5 minutes
+#  with no INBOUND traffic. Polling only makes OUTBOUND
+#  requests, so it never counts. Two things keep the app up:
+#    1. an uptime monitor hitting GET / every few minutes, and
+#    2. WEBHOOK_URL, which lets Telegram push updates into this
+#       very server instead of the bot calling out.
+#  No Flask needed - this stdlib handler already owns $PORT.
 # ============================================================
+
+# Set by start_health_server, so the entry point can refuse to register a
+# webhook that nothing is listening for.
+_HEALTH = {"bound": False, "port": 8080}
+
+# Public HTTPS address of this process, e.g. https://xxxx.b4a.run
+# Leave empty for polling mode (the default, and the safer choice).
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+# Shared secret Telegram must echo in X-Telegram-Bot-Api-Secret-Token.
+# Generated per run when unset - it only has to match within one process.
+WEBHOOK_SECRET = os.getenv("TELEGRAM_SECRET_TOKEN", "").strip() or secrets.token_urlsafe(32)
+WEBHOOK_PATH = "/telegram"
+
+
+def enable_webhook() -> bool:
+    """Register WEBHOOK_URL with Telegram. False -> caller falls back to polling."""
+    base = WEBHOOK_URL if "://" in WEBHOOK_URL else "https://" + WEBHOOK_URL
+    hook = base.rstrip("/") + WEBHOOK_PATH
+    try:
+        ok = bot.set_webhook(url=hook, secret_token=WEBHOOK_SECRET, max_connections=40)
+    except Exception as exc:  # noqa: BLE001 - a webhook error must not kill the bot
+        logger.error(f"set_webhook({hook}) failed: {exc}")
+        return False
+    if ok is False:
+        logger.error(f"Telegram rejected webhook {hook}")
+        return False
+    logger.info(f"Webhook registered: {hook}")
+    return True
+
 
 def start_health_server() -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     port = int(os.getenv("PORT", "8080"))
+    _HEALTH["port"] = port
 
     class _Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, body: str) -> None:
@@ -1947,6 +1986,40 @@ def start_health_server() -> None:
             else:
                 self._send(404, '{"error":"not found"}')
 
+        def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
+            """Telegram update delivery - only used when WEBHOOK_URL is set."""
+            if self.path.split("?", 1)[0] != WEBHOOK_PATH:
+                self._send(404, '{"error":"not found"}')
+                return
+            supplied = (self.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").encode()
+            if not secrets.compare_digest(supplied, WEBHOOK_SECRET.encode()):
+                self._send(403, '{"error":"bad secret"}')
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                update = telebot.types.Update.de_json(payload)
+            except Exception as exc:  # noqa: BLE001
+                # Telegram only sends valid JSON, so this is purely defensive.
+                # A non-2xx would make Telegram retry the SAME unparsable body
+                # forever, so acknowledge and drop it instead.
+                logger.warning(f"Webhook payload rejected: {exc}")
+                self._send(200, '{"ok":false,"reason":"unparsable"}')
+                return
+            if update is None:
+                logger.warning("Webhook update had no recognised content")
+                self._send(200, '{"ok":false,"reason":"unparsable"}')
+                return
+            try:
+                # TeleBot(threaded=True) queues the handler and returns at once,
+                # so Telegram gets its 200 without waiting for a download.
+                bot.process_new_updates([update])
+            except Exception as exc:  # transient -> let Telegram retry
+                logger.error(f"Webhook dispatch failed: {exc}", exc_info=True)
+                self._send(500, '{"error":"dispatch failed"}')
+                return
+            self._send(200, '{"ok":true}')
+
         def log_message(self, *_args) -> None:
             pass  # keep the request log out of bot.log
 
@@ -1956,7 +2029,8 @@ def start_health_server() -> None:
         except OSError as exc:
             logger.warning(f"Health endpoint could not bind :{port} - {exc}")
             return
-        logger.info(f"Health endpoint listening on :{port} (/, /health)")
+        _HEALTH["bound"] = True
+        logger.info(f"Health endpoint listening on :{port} (/, /health, POST /telegram)")
         httpd.serve_forever()
 
     threading.Thread(target=_serve, daemon=True, name="health").start()
@@ -1986,4 +2060,28 @@ if __name__ == "__main__":
     logger.info(f"Rate limit: {MAX_REQUESTS_PER_WINDOW} req/{RATE_LIMIT_WINDOW}s")
 
     start_health_server()
-    safe_polling()
+
+    if WEBHOOK_URL and _HEALTH["bound"] and enable_webhook():
+        logger.info(
+            "Webhook mode: Telegram pushes updates to this process, "
+            "polling stays off."
+        )
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user.")
+            sys.exit(0)
+    else:
+        if WEBHOOK_URL:
+            logger.warning(
+                "WEBHOOK_URL is set but could not be activated - "
+                "falling back to polling."
+            )
+        try:
+            # A leftover webhook makes getUpdates answer 409 and polling
+            # never receives anything.
+            bot.delete_webhook()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"delete_webhook failed (continuing): {exc}")
+        safe_polling()
