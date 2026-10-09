@@ -1,0 +1,12 @@
+# Normalize line endings for the whole repository.
+* text=auto
+
+# Shell scripts MUST stay LF. A CRLF checkout breaks `bash /start.sh`
+# inside the Docker build and the container exits immediately.
+*.sh   text eol=lf
+Dockerfile text eol=lf
+
+# Binary / already-exact files
+*.png  binary
+*.jpg  binary
+*.zip  binary

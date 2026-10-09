@@ -1,0 +1,27 @@
+# Secrets - NEVER commit these
+.env
+cookies.txt
+*.cookies.txt
+واریبل ها .txt
+
+# Runtime / local data
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+bot.log
+*.log
+downloads/
+_test_out/
+
+# Scratch / duplicate copies of the project
+Mega Downloader/
+Mega Downloader.zip
+_*.py
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

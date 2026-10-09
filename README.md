@@ -286,8 +286,18 @@ curl http://127.0.0.1:8080/health
 ## Troubleshooting
 
 ### "Sign in to confirm you're not a bot" (YouTube)
-→ Set up cookies (see Step 5 above) - on Railway put the whole file in `YOUTUBE_COOKIES`
-→ Run `/status`: if `PO token provider: off`, fix the PO token server (see below)
+
+YouTube wants a login from the server's IP. Read `/status` first — the cookie
+line now says exactly what is wrong:
+
+| `/status` cookie line | Meaning | Fix |
+|---|---|---|
+| `Not loaded \| file MISSING` | No cookie variable is set | Set `YOUTUBE_COOKIES_B64_1..N` (see Back4App section) |
+| `... rows, N EXPIRED` | The session ran out | Export a fresh `cookies.txt`, regenerate, redeploy |
+| `... rows, valid to ...` | Cookies look fine | Export fresh anyway - YouTube rotates sessions, then redeploy |
+
+Also check `PO token provider: off` - if it is off, fix the PO token server (below).
+
 → Update yt-dlp: `pip install --upgrade yt-dlp`
 
 ### `PO token provider: off` with "version mismatch"

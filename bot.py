@@ -216,6 +216,42 @@ def _looks_like_cookie_file(text: str) -> bool:
     return "Netscape HTTP Cookie File" in text[:400] or ".youtube.com" in text
 
 
+# What the loader learned about the cookies it installed.  YouTube
+# rejects an expired session with the very same "confirm you're not a
+# bot" message, so noticing the expiry here beats debugging downloads.
+_cookie_info: Dict[str, Any] = {"source": "", "rows": 0, "expired": 0, "expires": ""}
+
+
+def _analyse_cookies(text: str) -> Dict[str, Any]:
+    """Count cookie rows, expired rows and the earliest real expiry."""
+    now = time.time()
+    rows = expired = 0
+    soonest: Optional[float] = None
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) < 7:
+            continue
+        rows += 1
+        try:
+            expiry = float(fields[4])
+        except ValueError:
+            continue
+        if expiry <= 0:          # session cookie (YSC, ST-*) - no expiry
+            continue
+        if expiry < now:
+            expired += 1
+        elif soonest is None or expiry < soonest:
+            soonest = expiry
+    return {
+        "source": "",
+        "rows": rows,
+        "expired": expired,
+        "expires": datetime.fromtimestamp(soonest).strftime("%Y-%m-%d") if soonest else "",
+    }
+
+
 def _install_cookies(text: str, source: str) -> bool:
     """Write cookies to a temp file and point COOKIE_FILE at it.
 
@@ -237,8 +273,18 @@ def _install_cookies(text: str, source: str) -> bool:
         with handle:
             handle.write(text)
         COOKIE_FILE = handle.name
-        n_rows = sum(1 for line in text.splitlines() if line and not line.startswith("#"))
-        print(f"YouTube cookies loaded from {source} -> {COOKIE_FILE} ({n_rows} rows)")
+        _cookie_info.clear()
+        _cookie_info.update(_analyse_cookies(text))
+        _cookie_info["source"] = source
+        note = f"{_cookie_info['rows']} rows"
+        if _cookie_info["expired"]:
+            note += f", {_cookie_info['expired']} EXPIRED"
+        if _cookie_info["expires"]:
+            note += f", valid until {_cookie_info['expires']}"
+        print(f"YouTube cookies loaded from {source} -> {COOKIE_FILE} ({note})")
+        if _cookie_info["rows"] and _cookie_info["expired"] >= _cookie_info["rows"]:
+            print("WARNING: every YouTube cookie has expired - downloads will "
+                  "fail with 'confirm you're not a bot'. Export fresh cookies.")
         return True
     except Exception as exc:
         print(f"WARNING: failed to write cookie file from {source}: {exc}")
@@ -1290,10 +1336,25 @@ def _friendly_error(message: str) -> str:
     low = message.lower()
     hint = ""
     if "sign in" in low or "not a bot" in low or "login_required" in low:
-        hint = (
-            "YouTube is asking for a login from this server.\n"
-            "Fix: refresh YOUTUBE_COOKIES in the Railway environment variables."
-        )
+        if not _cookie_info.get("rows"):
+            hint = (
+                "No YouTube cookies are loaded on this host.\n"
+                "Fix: run make_cookie_env.py, set YOUTUBE_COOKIES_B64_1..N "
+                "in the environment variables, then redeploy. Check /status."
+            )
+        elif _cookie_info.get("expired"):
+            hint = (
+                f"{_cookie_info['expired']} of {_cookie_info['rows']} cookies have "
+                f"EXPIRED (last valid: {_cookie_info.get('expires') or 'n/a'}).\n"
+                "Fix: export a fresh cookies.txt from a logged-in browser, "
+                "regenerate the variables and redeploy."
+            )
+        else:
+            hint = (
+                "YouTube wants a login from this server. The cookies are present "
+                "and not expired, so export a fresh cookies.txt anyway - YouTube "
+                "rotates sessions. Regenerate the variables and redeploy."
+            )
     elif "requested format is not available" in low:
         hint = "That quality does not exist for this video. Pick a lower quality."
     elif "private video" in low or "members-only" in low:
@@ -1301,7 +1362,10 @@ def _friendly_error(message: str) -> str:
     elif "no video formats found" in low or "no video in this post" in low:
         hint = "This post has no video. Use the Photos button instead."
     elif "confirm" in low and "bot" in low:
-        hint = "Bot check. A PO token server plus fresh cookies is required on Railway."
+        hint = (
+            "Bot check. Fresh cookies plus the PO token server are required - "
+            "see PO token provider in /status."
+        )
     elif "unable to download webpage" in low or "timed out" in low:
         hint = "Network problem. Check YTDLP_PROXY or try again."
 
@@ -1418,7 +1482,17 @@ def handle_status(message: telebot.types.Message) -> None:
     with _states_lock:
         active_sessions = len(user_states)
 
-    cookies_status = "Present" if os.path.exists(COOKIE_FILE) else "Not found"
+    if _cookie_info.get("source"):
+        cookies_status = (
+            f"{_cookie_info['source']} - {_cookie_info['rows']} rows"
+            + (f", {_cookie_info['expired']} EXPIRED"
+               if _cookie_info["expired"] else "")
+            + (f", valid to {_cookie_info['expires']}"
+               if _cookie_info["expires"] else "")
+        )
+    else:
+        cookies_status = "Not loaded"
+    cookies_status += " | file " + ("found" if os.path.exists(COOKIE_FILE) else "MISSING")
     proxy_status = (
         "Connected" if (PROXY_ENABLED and not _proxy_needs_fallback)
         else "Fallback (direct)" if _proxy_needs_fallback
