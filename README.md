@@ -378,6 +378,25 @@ Also check `PO token provider: off` - if it is off, fix the PO token server (bel
   `PO Token server exited early` block. The bot still works without it - it
   just falls back to player clients that do not need a token.
 
+### Downloads are slow, or a link takes ages then fails
+
+Measured on a real run, so this is not guesswork:
+
+| Observation | Cause | Fix in the bot |
+|---|---|---|
+| A dead link took **19 s and 6 attempts** | YouTube says "This video **is** unavailable"; the marker only matched "video unavailable" | Permanent errors now stop after **1** attempt (`_is_impossible_error`) |
+| 3 concurrent downloads each got **0.51-0.9 MB/s** instead of **1.51 MB/s**, aggregate unchanged | unbounded threads split one pipe | `MAX_CONCURRENT_DOWNLOADS` (default 2); extras are **queued with a visible message** |
+| Rate crawled at **30 KB/s** for the first MBs | one fragment at a time | `CONCURRENT_FRAGMENTS=4` |
+| Two Instagram probes froze the whole bot | telebot defaults to **2** handler threads; a probe takes **4-10 s** | `TELEGRAM_THREADS=8` |
+| A stuck download could retry a dead network for minutes | 6 fallback tiers x 5 retries | `MAX_TIER_ATTEMPTS=4` + same-error short-circuit |
+
+Uptime monitors are **not** a cause: hammering `/health` as fast as
+`urllib` could during a download changed throughput by less than the run-to-run
+variation (22.5 s vs 30.7 s for the same file).
+
+Check the live state with `/status`: it reports
+`Downloads: <active>/<max>`.
+
 ### Instagram returns "Login required"
 → You need cookies.txt from a logged-in browser session
 

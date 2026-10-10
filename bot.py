@@ -521,7 +521,14 @@ logger.info(f"Instagram photo patch: {'APPLIED' if IG_PATCH_OK else 'FAILED'}")
 #  BOT INITIALIZATION
 # ============================================================
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+bot = telebot.TeleBot(
+    BOT_TOKEN,
+    parse_mode="HTML",
+    # telebot defaults to 2 threads shared by EVERY handler, and an
+    # Instagram probe runs inside a handler and takes 4-10s measured.
+    # Two slow probes therefore froze the bot for every other user.
+    num_threads=max(4, int(os.getenv("TELEGRAM_THREADS", "8"))),
+)
 
 try:
     bot.remove_webhook()
@@ -747,6 +754,10 @@ def build_ydl_opts(
         "socket_timeout": 30,
         "retries": 5,
         "fragment_retries": 5,
+        # One fragment at a time wastes the pipe: the measured rate ramped
+        # 30KB/s -> 6MB/s only late in the file. DASH/HLS can take 4
+        # fragments at once, which lifts the early rate.
+        "concurrent_fragment_downloads": max(1, int(os.getenv("CONCURRENT_FRAGMENTS", "4"))),
         "extractor_args": {},
         "user_agent": ua,
         "http_headers": {
@@ -1204,7 +1215,12 @@ def run_download(
 
     last_error: Optional[Exception] = None
     tried: List[Optional[List[str]]] = []
+    seen_errors: set = set()
+    max_attempts = max(1, int(os.getenv("MAX_TIER_ATTEMPTS", "4")))
     while tiers:
+        if len(tried) >= max_attempts:
+            logger.info(f"stopping after {max_attempts} player-client attempts")
+            break
         clients = tiers.pop(0)
         tried.append(clients)
         label = tier_label(clients)
@@ -1216,6 +1232,14 @@ def run_download(
             logger.warning(
                 f"attempt {len(tried)} [{label}] {type(e).__name__}: {str(e)[:250]}"
             )
+            # Another player-client only helps if it can fail differently.
+            # The same message twice means the remaining tiers are wasted
+            # full downloads (measured: 6 tiers x ~3-5s for a dead link).
+            fingerprint = " ".join(str(e).lower().split())
+            if fingerprint in seen_errors:
+                logger.info("same error from another player client - stopping")
+                break
+            seen_errors.add(fingerprint)
             if _is_po_crash(str(e)) and check_po_provider() in ("http", "script"):
                 # The provider itself blew up. Turn it off for good and
                 # walk the PO-free tiers instead of dying with it.
@@ -1233,14 +1257,27 @@ def run_download(
 
 
 def _is_impossible_error(error_text: str) -> bool:
-    """Errors where every other player-client will fail the same way."""
-    low = (error_text or "").lower()
+    """Errors where every other player-client will fail the same way.
+
+    Markers are matched against whitespace-normalised text because YouTube
+    says "This video is unavailable" - the bare "video unavailable" marker
+    never matched it, which cost 6 full attempts (~19s measured, far more on
+    a datacenter IP) just to report a dead link.
+    """
+    low = " ".join((error_text or "").lower().split())
     return any(marker in low for marker in (
         "private video",
         "video unavailable",
-        "account associated with this video has been terminated",
+        "video is unavailable",
+        "this video is unavailable",
+        "video is not available",
+        "video has been removed",
         "has been removed",
+        "account associated with this video has been terminated",
         "not available in your country",
+        "available in your country",
+        "uploader has not made this video available",
+        "country restriction",
     ))
 
 
@@ -1256,6 +1293,16 @@ def _is_po_crash(error_text: str) -> bool:
 #  MAIN DOWNLOAD LOGIC
 # ============================================================
 
+# Bound how many downloads run at once. Unbounded threads split one
+# network pipe N ways: measured 1.51 MB/s for a single download, but only
+# 0.51-0.87 MB/s each with three running (aggregate stayed 1.57 MB/s).
+# Queueing the extras is slower to start and faster to finish.
+MAX_CONCURRENT_DOWNLOADS: int = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2")))
+_DOWNLOAD_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_DOWNLOADS)
+_ACTIVE_DOWNLOADS: Dict[str, int] = {"n": 0}
+_ACTIVE_LOCK = threading.Lock()
+
+
 def download_and_send(chat_id: int, status_msg_id: int) -> None:
     with _states_lock:
         state = user_states.get(chat_id, {}).copy()
@@ -1267,6 +1314,20 @@ def download_and_send(chat_id: int, status_msg_id: int) -> None:
     if not url:
         _safe_edit(chat_id, status_msg_id, "Session expired. Send a new link.")
         return
+
+    # Take a download slot. Saying "queued" beats silently going slow.
+    if not _DOWNLOAD_SLOTS.acquire(blocking=False):
+        _safe_edit(
+            chat_id, status_msg_id,
+            f"<b>Queued</b> - another download is running.\n\n"
+            f"Max <code>{MAX_CONCURRENT_DOWNLOADS}</code> run at once so each "
+            f"one keeps its full speed. Yours starts as soon as a slot frees.",
+        )
+        _DOWNLOAD_SLOTS.acquire()
+    with _ACTIVE_LOCK:
+        _ACTIVE_DOWNLOADS["n"] += 1
+        active = _ACTIVE_DOWNLOADS["n"]
+    logger.info(f"download slot taken (active={active}/{MAX_CONCURRENT_DOWNLOADS})")
 
     paths: List[str] = []
     title = "Unknown"
@@ -1323,6 +1384,10 @@ def download_and_send(chat_id: int, status_msg_id: int) -> None:
             f"<b>Unexpected error:</b>\n<code>{esc(str(e))[:500]}</code>",
         )
     finally:
+        # Release the slot first: a cleanup error must never leak it.
+        with _ACTIVE_LOCK:
+            _ACTIVE_DOWNLOADS["n"] -= 1
+        _DOWNLOAD_SLOTS.release()
         for path in paths:
             if path and os.path.exists(path):
                 try:
@@ -1508,6 +1573,7 @@ def handle_status(message: telebot.types.Message) -> None:
             f"yt-dlp: <code>{esc(yt_dlp.version.__version__)}</code>\n"
             f"Instagram photos: <code>{'ON' if IG_PATCH_OK else 'OFF'}</code>\n"
             f"Active sessions: <code>{active_sessions}</code>\n"
+            f"Downloads: <code>{_ACTIVE_DOWNLOADS['n']}/{MAX_CONCURRENT_DOWNLOADS}</code>\n"
             f"FFmpeg: <code>{'Present' if FFMPEG_AVAILABLE else 'MISSING'}</code>\n"
             f"Cookies: <code>{esc(cookies_status)}</code>\n"
             f"PO token provider: <code>{esc(check_po_provider())}</code>\n"
@@ -1837,6 +1903,11 @@ def handle_type_selection(call: telebot.types.CallbackQuery) -> None:
             text = "<b>Audio (MP3)</b> - Select quality:"
         else:
             return
+        # Carry the link inside this message. _recover_state rebuilds the
+        # session from it, so without one the tap after a restart lands on
+        # "This selection has expired" - which is exactly the "expired" the
+        # user sees when Back4App restarts the container mid-flow.
+        keep_url = state.get("url", "")
 
     if data == "type_image":
         target = _edit_or_send(
@@ -1847,6 +1918,8 @@ def handle_type_selection(call: telebot.types.CallbackQuery) -> None:
         _start_download(chat_id, target)
         return
 
+    if text and keep_url:
+        text = f"{text}\n\n<code>{esc(keep_url)}</code>"
     _edit_or_send(chat_id, call.message.message_id, text, markup)
 
 
@@ -1982,6 +2055,8 @@ def start_health_server() -> None:
                     "po_provider": _po_status.get("mode") or "unchecked",
                     "po_detail": _po_status.get("detail"),
                     "instagram_photos": bool(IG_PATCH_OK),
+                    "active_downloads": _ACTIVE_DOWNLOADS["n"],
+                    "max_downloads": MAX_CONCURRENT_DOWNLOADS,
                 }, ensure_ascii=False))
             else:
                 self._send(404, '{"error":"not found"}')
